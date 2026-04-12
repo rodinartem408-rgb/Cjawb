@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import Any
+from typing import List
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -37,6 +37,7 @@ class User(Base):
     balance: Mapped[float] = mapped_column(Float, default=0.0)
     referrer_id: Mapped[int] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    orders: Mapped[list['Order']] = relationship(back_populates='user')
 
 class Category(Base):
     __tablename__ = 'categories'
@@ -60,18 +61,21 @@ class Order(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('users.id'))
     product_id: Mapped[int] = mapped_column(ForeignKey('products.id'))
     price: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    user: Mapped['User'] = relationship(back_populates='orders')
 
-# --- ENGINE & SESSION ---
+# --- DB ENGINE ---
 engine = create_async_engine(DATABASE_URL)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
-# --- STATES ---
+# --- FSM STATES ---
 class AdminStates(StatesGroup):
     add_cat_name = State()
     add_prod_name = State()
     add_prod_desc = State()
     add_prod_price = State()
     add_prod_content = State()
+    broadcast_msg = State()
 
 # --- MIDDLEWARE ---
 class DbSessionMiddleware(BaseMiddleware):
@@ -81,24 +85,30 @@ class DbSessionMiddleware(BaseMiddleware):
             return await handler(event, data)
 
 # --- KEYBOARDS ---
-def main_kb():
+def main_menu_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🛒 Магазин")],
-        [KeyboardButton(text="💰 Пополнение"), KeyboardButton(text="👤 Профиль")],
-        [KeyboardButton(text="📋 Инфо")]
+        [KeyboardButton(text="🛒 Магазин"), KeyboardButton(text="👤 Личный кабинет")],
+        [KeyboardButton(text="💰 Пополнение"), KeyboardButton(text="💸 Вывод")],
+        [KeyboardButton(text="📋 Информация")]
     ], resize_keyboard=True)
 
-def admin_kb():
+def admin_menu_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Категория"), KeyboardButton(text="➕ Товар")],
-        [KeyboardButton(text="📊 Статистика")]
+        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📢 Рассылка")],
+        [KeyboardButton(text="🏠 Меню")]
     ], resize_keyboard=True)
 
-# --- HANDLERS ---
+def back_btn(callback_data: str):
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data=callback_data))
+    return builder.as_markup()
+
+# --- HANDLERS: CORE ---
 dp = Dispatcher(storage=MemoryStorage())
 
 @dp.message(CommandStart())
-async def start(message: Message, session: AsyncSession):
+async def cmd_start(message: Message, session: AsyncSession):
     args = message.text.split()
     ref_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
     
@@ -113,52 +123,61 @@ async def start(message: Message, session: AsyncSession):
             res_ref = await session.execute(select(User).where(User.id == ref_id))
             ref_user = res_ref.scalar_one_or_none()
             if ref_user:
-                ref_user.balance += 5.0
+                ref_user.balance += 10.0 # Бонус за реферала
                 await session.commit()
 
-    await message.answer(f"👋 Привет, {message.from_user.first_name}!", reply_markup=main_kb())
+    await message.answer(f"🔥 **Добро пожаловать в Shadow Store!**\n\nЛучший выбор софта и баз в одном месте.", 
+                         reply_markup=main_menu_kb(), parse_mode="Markdown")
 
+# --- HANDLERS: SHOP ---
 @dp.message(F.text == "🛒 Магазин")
-async def shop(message: Message, session: AsyncSession):
+async def shop_main(message: Message, session: AsyncSession):
     res = await session.execute(select(Category))
     cats = res.scalars().all()
     builder = InlineKeyboardBuilder()
     for c in cats:
-        builder.add(InlineKeyboardButton(text=c.name, callback_data=f"cat_{c.id}"))
+        builder.add(InlineKeyboardButton(text=f"📁 {c.name}", callback_data=f"cat_{c.id}"))
     builder.adjust(2)
-    await message.answer("📂 Выберите категорию:", reply_markup=builder.as_markup())
+    await message.answer("📂 **Выберите категорию товаров:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("cat_"))
-async def show_prods(callback: CallbackQuery, session: AsyncSession):
+async def cat_products(callback: CallbackQuery, session: AsyncSession):
     cat_id = int(callback.data.split("_")[1])
     res = await session.execute(select(Product).where(Product.category_id == cat_id))
     prods = res.scalars().all()
+    
     builder = InlineKeyboardBuilder()
     for p in prods:
-        builder.add(InlineKeyboardButton(text=f"{p.name} (${p.price})", callback_data=f"p_{p.id}"))
-    builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_cats"))
+        builder.add(InlineKeyboardButton(text=f"{p.name} — ${p.price}", callback_data=f"p_{p.id}"))
+    builder.add(InlineKeyboardButton(text="⬅️ Назад в категории", callback_data="back_to_cats"))
     builder.adjust(1)
-    await callback.message.edit_text("📦 Товары:", reply_markup=builder.as_markup())
+    
+    await callback.message.edit_text("📦 **Доступные товары:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "back_to_cats")
 async def back_cats(callback: CallbackQuery, session: AsyncSession):
-    await shop(callback.message, session)
+    await shop_main(callback.message, session)
 
 @dp.callback_query(F.data.startswith("p_"))
-async def prod_info(callback: CallbackQuery, session: AsyncSession):
+async def prod_view(callback: CallbackQuery, session: AsyncSession):
     pid = int(callback.data.split("_")[1])
     res = await session.execute(select(Product).where(Product.id == pid))
     p = res.scalar_one_or_none()
     if not p: return
+
+    text = (f"💎 **{p.name}**\n\n"
+            f"📝 {p.description}\n\n"
+            f"💰 **Цена: ${p.price}**")
     
-    text = f"💎 **{p.name}**\n\n{p.description}\n\n💰 Цена: ${p.price}"
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="🛒 Купить", callback_data=f"buy_{p.id}"))
+    builder.add(InlineKeyboardButton(text="🛒 Купить сейчас", callback_data=f"buy_{p.id}"))
     builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cat_{p.category_id}"))
+    builder.adjust(1)
+    
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("buy_"))
-async def buy(callback: CallbackQuery, session: AsyncSession):
+async def buy_item(callback: CallbackQuery, session: AsyncSession):
     pid = int(callback.data.split("_")[1])
     uid = callback.from_user.id
     
@@ -168,85 +187,129 @@ async def buy(callback: CallbackQuery, session: AsyncSession):
     u = res_u.scalar_one_or_none()
 
     if u.balance < p.price:
-        await callback.answer("❌ Недостаточно средств!", show_alert=True)
+        await callback.answer("❌ Недостаточно средств! Пополните баланс.", show_alert=True)
         return
 
     u.balance -= p.price
     session.add(Order(user_id=u.id, product_id=p.id, price=p.price))
     await session.commit()
-    await callback.message.answer(f"✅ Успешно!\n\n📦 Контент:\n`{p.content}`", parse_mode="Markdown")
+    
+    await callback.message.answer(f"✅ **Покупка завершена!**\n\n📦 **Ваш товар:**\n`{p.content}`", parse_mode="Markdown")
     await callback.answer()
 
-@dp.message(F.text == "👤 Профиль")
+# --- HANDLERS: USER MENU ---
+@dp.message(F.text == "👤 Личный кабинет")
 async def profile(message: Message, session: AsyncSession):
     res = await session.execute(select(User).where(User.id == message.from_user.id))
     u = res.scalar_one_or_none()
-    await message.answer(f"👤 **Профиль**\n\n💰 Баланс: `${u.balance:.2f}`\n🆔 ID: `{u.id}`", parse_mode="Markdown")
+    ref_link = f"https://t.me/{(await message.bot.get_me()).username}?start={u.id}"
+    
+    text = (f"👤 **Ваш профиль**\n\n"
+            f"🆔 ID: `{u.id}`\n"
+            f"💰 Баланс: **${u.balance:.2f}**\n"
+            f"🔗 Реф. ссылка: `{ref_link}`")
+    await message.answer(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
 
 @dp.message(F.text == "💰 Пополнение")
-async def dep(message: Message):
-    await message.answer("💳 Для пополнения напишите @admin_support (Симуляция)")
+async def deposit(message: Message):
+    await message.answer("💳 **Пополнение баланса**\n\nДля пополнения счета напишите администратору: @ManerProga\n\nПосле оплаты баланс будет пополнен в течение 10-30 минут.", parse_mode="Markdown")
 
-@dp.message(F.text == "📋 Инфо")
+@dp.message(F.text == "💸 Вывод")
+async def withdraw(message: Message):
+    await message.answer("📤 **Вывод средств**\n\nДля вывода средств напишите в поддержку: @ManerProga", parse_mode="Markdown")
+
+@dp.message(F.text == "📋 Информация")
 async def info(message: Message):
-    await message.answer("ℹ️ Shadow Store v1.0\nВсе права защищены.")
+    await message.answer("ℹ️ **Shadow Store**\n\n🤖 Бот работает в автоматическом режиме.\n🛡 Все сделки защищены.\n👨‍💻 Поддержка: @ManerProga", parse_mode="Markdown")
 
-# --- ADMIN HANDLERS ---
+# --- HANDLERS: ADMIN ---
+@dp.message(F.text == "🏠 Меню", F.from_user.id == ADMIN_ID)
+async def admin_home(message: Message):
+    await message.answer("👨‍💻 **Админ-панель управления**", reply_markup=admin_menu_kb(), parse_mode="Markdown")
+
 @dp.message(F.text == "➕ Категория", F.from_user.id == ADMIN_ID)
-async def adm_cat(message: Message, state: FSMContext):
-    await message.answer("Введите имя категории:")
+async def adm_add_cat(message: Message, state: FSMContext):
+    await message.answer("Введите название новой категории:")
     await state.set_state(AdminStates.add_cat_name)
 
 @dp.message(AdminStates.add_cat_name)
 async def adm_cat_save(message: Message, state: FSMContext, session: AsyncSession):
     session.add(Category(name=message.text))
     await session.commit()
-    await message.answer("✅ Категория создана!")
+    await message.answer(f"✅ Категория '{message.text}' создана!")
     await state.clear()
 
 @dp.message(F.text == "➕ Товар", F.from_user.id == ADMIN_ID)
-async def adm_prod(message: Message, state: FSMContext):
+async def adm_add_prod(message: Message, state: FSMContext):
     await message.answer("Введите название товара:")
     await state.set_state(AdminStates.add_prod_name)
 
 @dp.message(AdminStates.add_prod_name)
 async def adm_p_name(message: Message, state: FSMContext):
     await state.update_data(n=message.text)
-    await message.answer("Введите описание:")
+    await message.answer("Введите описание товара:")
     await state.set_state(AdminStates.add_prod_desc)
 
 @dp.message(AdminStates.add_prod_desc)
 async def adm_p_desc(message: Message, state: FSMContext):
     await state.update_data(d=message.text)
-    await message.answer("Введите цену (число):")
+    await message.answer("Введите цену (только число):")
     await state.set_state(AdminStates.add_prod_price)
 
 @dp.message(AdminStates.add_prod_price)
 async def adm_p_price(message: Message, state: FSMContext):
     try:
         await state.update_data(p=float(message.text))
-        await message.answer("Введите контент (ссылка/текст):")
+        await message.answer("Введите контент (ссылка или текст):")
         await state.set_state(AdminStates.add_prod_content)
-    except: await message.answer("Ошибка! Введите число.")
+    except: await message.answer("❌ Ошибка! Введите число (например: 50.5)")
 
 @dp.message(AdminStates.add_prod_content)
 async def adm_p_final(message: Message, state: FSMContext, session: AsyncSession):
     data = await state.get_data()
     res = await session.execute(select(Category))
     cat = res.scalars().first()
-    if not cat: return await message.answer("Нет категорий!")
+    if not cat: return await message.answer("❌ Сначала создайте категорию!")
     
     session.add(Product(category_id=cat.id, name=data['n'], description=data['d'], price=data['p'], content=message.text))
     await session.commit()
-    await message.answer("✅ Товар добавлен!")
+    await message.answer("✅ Товар успешно добавлен в первую категорию!")
     await state.clear()
 
 @dp.message(F.text == "📊 Статистика", F.from_user.id == ADMIN_ID)
-async def adm_stat(message: Message, session: AsyncSession):
+async def adm_stats(message: Message, session: AsyncSession):
     u_count = await session.execute(select(func.count(User.id)))
-    await message.answer(f"📈 Пользователей: {u_count.scalar()}")
+    o_count = await session.execute(select(func.count(Order.id)))
+    rev = await session.execute(select(func.sum(Order.price)))
+    
+    text = (f"📊 **Статистика магазина**\n\n"
+            f"👥 Пользователей: `{u_count.scalar()}`\n"
+            f"📦 Заказов: `{o_count.scalar()}`\n"
+            f"💰 Выручка: `${rev.scalar() or 0:.2f}`")
+    await message.answer(text, parse_mode="Markdown")
 
-# --- STARTUP ---
+@dp.message(F.text == "📢 Рассылка", F.from_user.id == ADMIN_ID)
+async def adm_broadcast_start(message: Message, state: FSMContext):
+    await message.answer("Введите сообщение для рассылки всем пользователям:")
+    await state.set_state(AdminStates.broadcast_msg)
+
+@dp.message(AdminStates.broadcast_msg)
+async def adm_broadcast_run(message: Message, state: FSMContext, session: AsyncSession):
+    res = await session.execute(select(User.id))
+    user_ids = res.scalars().all()
+    
+    count = 0
+    for uid in user_ids:
+        try:
+            await message.bot.send_message(uid, message.text, parse_mode="Markdown")
+            count += 1
+            await asyncio.sleep(0.05) # Защита от флуд-лимитов
+        except: pass
+    
+    await message.answer(f"✅ Рассылка завершена!\nПолучили: `{count}` чел.")
+    await state.clear()
+
+# --- BOOTSTRAP ---
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -256,8 +319,8 @@ async def init_db():
             c = Category(name="Общее")
             session.add(c)
             await session.commit()
-            await session.execute(select(c)) # refresh
-            session.add(Product(category_id=c.id, name="Тест", description="Тест", price=10.0, content="TEST_DATA"))
+            await session.execute(select(c))
+            session.add(Product(category_id=c.id, name="Test Item", description="Test", price=1.0, content="TEST_CONTENT"))
             await session.commit()
 
 async def main():
