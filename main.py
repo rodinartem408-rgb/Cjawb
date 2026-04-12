@@ -64,11 +64,11 @@ class Order(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     user: Mapped['User'] = relationship(back_populates='orders')
 
-# --- ENGINE ---
+# --- DB ENGINE ---
 engine = create_async_engine(DATABASE_URL)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
-# --- STATES ---
+# --- FSM STATES ---
 class AdminStates(StatesGroup):
     add_cat_name = State()
     add_prod_name = State()
@@ -76,6 +76,8 @@ class AdminStates(StatesGroup):
     add_prod_price = State()
     add_prod_content = State()
     broadcast_msg = State()
+    add_balance_user_id = State()    # Состояние для ввода ID
+    add_balance_amount = State()     # Состояние для ввода суммы
 
 # --- MIDDLEWARE ---
 class DbSessionMiddleware(BaseMiddleware):
@@ -91,35 +93,26 @@ def main_menu_kb(user_id: int) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="💰 Пополнение"), KeyboardButton(text="💸 Вывод")],
         [KeyboardButton(text="📋 Информация")]
     ]
-    # ЕСЛИ ПОЛЬЗОВАТЕЛЬ АДМИН — ДОБАВЛЯЕМ КНОПКУ АДМИНКИ
     if user_id == ADMIN_ID:
         buttons.append([KeyboardButton(text="👨‍💻 Админка")])
-        
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 def admin_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Категория"), KeyboardButton(text="➕ Товар")],
-        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📢 Рассылка")],
-        [KeyboardButton(text="🏠 Меню")]
+        [KeyboardButton(text="💰 Выдать баланс"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="🏠 Меню")]
     ], resize_keyboard=True)
 
-def back_btn(callback_data: str):
-    builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data=callback_data))
-    return builder.as_markup()
-
-# --- HANDLERS ---
+# --- HANDLERS: CORE ---
 dp = Dispatcher(storage=MemoryStorage())
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, session: AsyncSession):
     args = message.text.split()
     ref_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
-    
     res = await session.execute(select(User).where(User.id == message.from_user.id))
     user = res.scalar_one_or_none()
-    
     if not user:
         user = User(id=message.from_user.id, username=message.from_user.username, referrer_id=ref_id)
         session.add(user)
@@ -130,20 +123,10 @@ async def cmd_start(message: Message, session: AsyncSession):
             if ref_user:
                 ref_user.balance += 10.0
                 await session.commit()
-
     await message.answer(f"🔥 **Shadow Store**\n\nДобро пожаловать!", 
                          reply_markup=main_menu_kb(message.from_user.id), parse_mode="Markdown")
 
-# --- ADMIN COMMANDS ---
-@dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
-async def cmd_admin_enter(message: Message):
-    await message.answer("👨‍💻 **Панель управления:**", reply_markup=admin_menu_kb(), parse_mode="Markdown")
-
-@dp.message(F.text == "👨‍💻 Админка", F.from_user.id == ADMIN_ID)
-async def admin_panel_click(message: Message):
-    await message.answer("👨‍💻 **Панель управления:**", reply_markup=admin_menu_kb(), parse_mode="Markdown")
-
-# --- SHOP HANDLERS ---
+# --- HANDLERS: SHOP ---
 @dp.message(F.text == "🛒 Магазин")
 async def shop_main(message: Message, session: AsyncSession):
     res = await session.execute(select(Category))
@@ -178,7 +161,7 @@ async def prod_view(callback: CallbackQuery, session: AsyncSession):
     if not p: return
     text = f"💎 **{p.name}**\n\n📝 {p.description}\n\n💰 **Цена: ${p.price}**"
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="🛒 Купить", callback_data=f"buy_{p.id}"))
+    builder.add(InlineKeyboardButton(text="🛒 Купить сейчас", callback_data=f"buy_{p.id}"))
     builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cat_{p.category_id}"))
     builder.adjust(1)
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
@@ -224,73 +207,132 @@ async def withdraw(message: Message):
 async def info(message: Message):
     await message.answer("ℹ️ **Shadow Store v1.0**\nПоддержка: @ManerProga", parse_mode="Markdown")
 
-# --- ADMIN ACTIONS ---
+# --- ADMIN HANDLERS ---
+@dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
+async def cmd_admin_enter(message: Message):
+    await message.answer("👨‍💻 **Панель управления:**", reply_markup=admin_menu_kb(), parse_mode="Markdown")
+
+@dp.message(F.text == "👨‍💻 Админка", F.from_user.id == ADMIN_ID)
+async def admin_panel_click(message: Message):
+    await message.answer("👨‍💻 **Панель управления:**", reply_markup=admin_menu_kb(), parse_mode="Markdown")
+
 @dp.message(F.text == "🏠 Меню", F.from_user.id == ADMIN_ID)
 async def admin_home(message: Message):
     await message.answer("👨‍💻 **Панель управления:**", reply_markup=admin_menu_kb(), parse_mode="Markdown")
 
+# --- NEW: GIVE BALANCE ---
+@dp.message(F.text == "💰 Выдать баланс", F.from_user.id == ADMIN_ID)
+async def adm_give_bal_start(message: Message, state: FSMContext):
+    await message.answer("Введите **ID пользователя**, которому хотите начислить баланс:")
+    await state.set_state(AdminStates.add_balance_user_id)
+
+@dp.message(AdminStates.add_balance_user_id)
+async def adm_give_bal_id(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text.isdigit():
+        await message.answer("❌ Ошибка! Введите числовой ID.")
+        return
+    
+    uid = int(message.text)
+    res = await session.execute(select(User).where(User.id == uid))
+    user = res.scalar_one_or_none()
+    
+    if not user:
+        await message.answer("❌ Пользователь с таким ID не найден. Попробуйте еще раз:")
+        return
+    
+    await state.update_data(target_id=uid)
+    await message.answer(f"✅ Пользователь `{uid}` найден.\nВведите **сумму** для начисления:", parse_mode="Markdown")
+    await state.set_state(AdminStates.add_balance_amount)
+
+@dp.message(AdminStates.add_balance_amount)
+async def adm_give_bal_final(message: Message, state: FSMContext, session: AsyncSession):
+    try:
+        amount = float(message.text)
+        data = await state.get_data()
+        uid = data['target_id']
+        
+        res = await session.execute(select(User).where(User.id == uid))
+        user = res.scalar_one_or_none()
+        
+        user.balance += amount
+        await session.commit()
+        
+        await message.answer(f"✅ **Успешно!**\nПользователю `{uid}` начислено **${amount:.2f}**.", parse_mode="Markdown")
+        
+        # Notify User
+        try:
+            await message.bot.send_message(uid, f"💰 **Вам начислено ${amount:.2f} администратором!**", parse_mode="Markdown")
+        except:
+            pass
+            
+    except ValueError:
+        await message.answer("❌ Ошибка! Введите число (например: 50.5)")
+        return
+    await state.clear()
+
+# --- OTHER ADMIN ACTIONS ---
 @dp.message(F.text == "➕ Категория", F.from_user.id == ADMIN_ID)
-async def adm_cat(message: Message, state: FSMContext):
-    await message.answer("Введите имя категории:")
+async def adm_add_cat(message: Message, state: FSMContext):
+    await message.answer("Введите название новой категории:")
     await state.set_state(AdminStates.add_cat_name)
 
 @dp.message(AdminStates.add_cat_name)
 async def adm_cat_save(message: Message, state: FSMContext, session: AsyncSession):
     session.add(Category(name=message.text))
     await session.commit()
-    await message.answer("✅ Создано!")
+    await message.answer(f"✅ Категория '{message.text}' создана!")
     await state.clear()
 
 @dp.message(F.text == "➕ Товар", F.from_user.id == ADMIN_ID)
-async def adm_prod(message: Message, state: FSMContext):
-    await message.answer("Название товара:")
+async def adm_add_prod(message: Message, state: FSMContext):
+    await message.answer("Введите название товара:")
     await state.set_state(AdminStates.add_prod_name)
 
 @dp.message(AdminStates.add_prod_name)
 async def adm_p_name(message: Message, state: FSMContext):
     await state.update_data(n=message.text)
-    await message.answer("Описание:")
+    await message.answer("Введите описание товара:")
     await state.set_state(AdminStates.add_prod_desc)
 
 @dp.message(AdminStates.add_prod_desc)
 async def adm_p_desc(message: Message, state: FSMContext):
     await state.update_data(d=message.text)
-    await message.answer("Цена (число):")
+    await message.answer("Введите цену (только число):")
     await state.set_state(AdminStates.add_prod_price)
 
 @dp.message(AdminStates.add_prod_price)
 async def adm_p_price(message: Message, state: FSMContext):
     try:
         await state.update_data(p=float(message.text))
-        await message.answer("Контент (ссылка/текст):")
+        await message.answer("Введите контент (ссылка или текст):")
         await state.set_state(AdminStates.add_prod_content)
-    except: await message.answer("Ошибка! Введите число.")
+    except: await message.answer("❌ Ошибка! Введите число.")
 
 @dp.message(AdminStates.add_prod_content)
 async def adm_p_final(message: Message, state: FSMContext, session: AsyncSession):
     data = await state.get_data()
     res = await session.execute(select(Category))
     cat = res.scalars().first()
-    if not cat: return await message.answer("Нет категорий!")
+    if not cat: return await message.answer("❌ Сначала создайте категорию!")
     session.add(Product(category_id=cat.id, name=data['n'], description=data['d'], price=data['p'], content=message.text))
     await session.commit()
     await message.answer("✅ Товар добавлен!")
     await state.clear()
 
 @dp.message(F.text == "📊 Статистика", F.from_user.id == ADMIN_ID)
-async def adm_stat(message: Message, session: AsyncSession):
+async def adm_stats(message: Message, session: AsyncSession):
     u_count = await session.execute(select(func.count(User.id)))
     o_count = await session.execute(select(func.count(Order.id)))
     rev = await session.execute(select(func.sum(Order.price)))
     await message.answer(f"📊 **Статистика**\n\nЮзеров: `{u_count.scalar()}`\nЗаказов: `{o_count.scalar()}`\nВыручка: `${rev.scalar() or 0:.2f}`", parse_mode="Markdown")
 
 @dp.message(F.text == "📢 Рассылка", F.from_user.id == ADMIN_ID)
-async def adm_broad(message: Message, state: FSMContext):
+async def adm_broadcast_start(message: Message, state: FSMContext):
     await message.answer("Введите текст рассылки:")
     await state.set_state(AdminStates.broadcast_msg)
 
 @dp.message(AdminStates.broadcast_msg)
-async def adm_broad_run(message: Message, state: FSMContext, session: AsyncSession):
+async def adm_broadcast_run(message: Message, state: FSMContext, session: AsyncSession):
     res = await session.execute(select(User.id))
     ids = res.scalars().all()
     count = 0
