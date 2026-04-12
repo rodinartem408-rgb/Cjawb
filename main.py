@@ -2,39 +2,33 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import Union, List, Optional
+from typing import Any
 
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup, 
-    ReplyKeyboardMarkup, 
-    KeyboardButton,
-    CallbackQuery,
-    Message
+    InlineKeyboardButton, InlineKeyboardMarkup, 
+    ReplyKeyboardMarkup, KeyboardButton, 
+    CallbackQuery, Message
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from sqlalchemy import BigInteger, String, Float, ForeignKey, Text, DateTime, select, update, delete
+from sqlalchemy import BigInteger, String, Float, ForeignKey, Text, DateTime, select, func
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from redis.asyncio import Redis
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///db.sqlite3")
 
-# --- DATABASE MODELS ---
-class Base(DeclarativeBase):
-    pass
+# --- DB MODELS ---
+class Base(DeclarativeBase): pass
 
 class User(Base):
     __tablename__ = 'users'
@@ -43,9 +37,6 @@ class User(Base):
     balance: Mapped[float] = mapped_column(Float, default=0.0)
     referrer_id: Mapped[int] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    
-    orders: Mapped[list['Order']] = relationship(back_populates='user')
-    transactions: Mapped[list['Transaction']] = relationship(back_populates='user')
 
 class Category(Base):
     __tablename__ = 'categories'
@@ -60,9 +51,7 @@ class Product(Base):
     name: Mapped[str] = mapped_column(String)
     description: Mapped[str] = mapped_column(Text)
     price: Mapped[float] = mapped_column(Float)
-    content: Mapped[str] = mapped_column(Text)  # Link to file or text content
-    image_id: Mapped[str] = mapped_column(String, nullable=True) # Telegram file_id
-    
+    content: Mapped[str] = mapped_column(Text)
     category: Mapped['Category'] = relationship(back_populates='products')
 
 class Order(Base):
@@ -71,83 +60,213 @@ class Order(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('users.id'))
     product_id: Mapped[int] = mapped_column(ForeignKey('products.id'))
     price: Mapped[float] = mapped_column(Float)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    
-    user: Mapped['User'] = relationship(back_populates='orders')
 
-class Transaction(Base):
-    __tablename__ = 'transactions'
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('users.id'))
-    amount: Mapped[float] = mapped_column(Float)
-    type: Mapped[str] = mapped_column(String)  # 'deposit', 'withdraw', 'purchase'
-    status: Mapped[str] = mapped_column(String) # 'completed', 'pending'
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    
-    user: Mapped['User'] = relationship(back_populates='transactions')
-
-# --- DATABASE ENGINE ---
-engine = create_async_engine(DATABASE_URL, echo=False)
+# --- ENGINE & SESSION ---
+engine = create_async_engine(DATABASE_URL)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
-# --- FSM STATES ---
-class ShopStates(StatesGroup):
-    buying_product = State()
-    searching_category = State()
-
+# --- STATES ---
 class AdminStates(StatesGroup):
-    adding_category_name = State()
-    adding_product_name = State()
-    adding_product_desc = State()
-    adding_product_price = State()
-    adding_product_content = State()
-    adding_product_image = State()
-    broadcasting = State()
+    add_cat_name = State()
+    add_prod_name = State()
+    add_prod_desc = State()
+    add_prod_price = State()
+    add_prod_content = State()
 
-class DepositStates(StatesGroup):
-    waiting_for_amount = State()
+# --- MIDDLEWARE ---
+class DbSessionMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        async with async_session() as session:
+            data["session"] = session
+            return await handler(event, data)
 
 # --- KEYBOARDS ---
-def main_menu_kb(user_id: int) -> ReplyKeyboardMarkup:
-    buttons = [
+def main_kb():
+    return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🛒 Магазин")],
-        [KeyboardButton(text="💰 Пополнение"), KeyboardButton(text="💸 Вывод")],
-        [KeyboardButton(text="👤 Личный кабинет"), KeyboardButton(text="📋 Информация")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+        [KeyboardButton(text="💰 Пополнение"), KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="📋 Инфо")]
+    ], resize_keyboard=True)
 
-def admin_menu_kb() -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton(text="➕ Добавить категорию"), KeyboardButton(text="➕ Добавить товар")],
-        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📢 Рассылка")],
-        [KeyboardButton(text="👥 Пользователи")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+def admin_kb():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="➕ Категория"), KeyboardButton(text="➕ Товар")],
+        [KeyboardButton(text="📊 Статистика")]
+    ], resize_keyboard=True)
 
-def back_button(prefix: str) -> InlineKeyboardMarkup:
+# --- HANDLERS ---
+dp = Dispatcher(storage=MemoryStorage())
+
+@dp.message(CommandStart())
+async def start(message: Message, session: AsyncSession):
+    args = message.text.split()
+    ref_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+    
+    res = await session.execute(select(User).where(User.id == message.from_user.id))
+    user = res.scalar_one_or_none()
+    
+    if not user:
+        user = User(id=message.from_user.id, username=message.from_user.username, referrer_id=ref_id)
+        session.add(user)
+        await session.commit()
+        if ref_id and ref_id != user.id:
+            res_ref = await session.execute(select(User).where(User.id == ref_id))
+            ref_user = res_ref.scalar_one_or_none()
+            if ref_user:
+                ref_user.balance += 5.0
+                await session.commit()
+
+    await message.answer(f"👋 Привет, {message.from_user.first_name}!", reply_markup=main_kb())
+
+@dp.message(F.text == "🛒 Магазин")
+async def shop(message: Message, session: AsyncSession):
+    res = await session.execute(select(Category))
+    cats = res.scalars().all()
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data=prefix))
-    return builder.as_markup()
+    for c in cats:
+        builder.add(InlineKeyboardButton(text=c.name, callback_data=f"cat_{c.id}"))
+    builder.adjust(2)
+    await message.answer("📂 Выберите категорию:", reply_markup=builder.as_markup())
 
-# --- DATABASE UTILS ---
+@dp.callback_query(F.data.startswith("cat_"))
+async def show_prods(callback: CallbackQuery, session: AsyncSession):
+    cat_id = int(callback.data.split("_")[1])
+    res = await session.execute(select(Product).where(Product.category_id == cat_id))
+    prods = res.scalars().all()
+    builder = InlineKeyboardBuilder()
+    for p in prods:
+        builder.add(InlineKeyboardButton(text=f"{p.name} (${p.price})", callback_data=f"p_{p.id}"))
+    builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_cats"))
+    builder.adjust(1)
+    await callback.message.edit_text("📦 Товары:", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "back_to_cats")
+async def back_cats(callback: CallbackQuery, session: AsyncSession):
+    await shop(callback.message, session)
+
+@dp.callback_query(F.data.startswith("p_"))
+async def prod_info(callback: CallbackQuery, session: AsyncSession):
+    pid = int(callback.data.split("_")[1])
+    res = await session.execute(select(Product).where(Product.id == pid))
+    p = res.scalar_one_or_none()
+    if not p: return
+    
+    text = f"💎 **{p.name}**\n\n{p.description}\n\n💰 Цена: ${p.price}"
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text="🛒 Купить", callback_data=f"buy_{p.id}"))
+    builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cat_{p.category_id}"))
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("buy_"))
+async def buy(callback: CallbackQuery, session: AsyncSession):
+    pid = int(callback.data.split("_")[1])
+    uid = callback.from_user.id
+    
+    res_p = await session.execute(select(Product).where(Product.id == pid))
+    p = res_p.scalar_one_or_none()
+    res_u = await session.execute(select(User).where(User.id == uid))
+    u = res_u.scalar_one_or_none()
+
+    if u.balance < p.price:
+        await callback.answer("❌ Недостаточно средств!", show_alert=True)
+        return
+
+    u.balance -= p.price
+    session.add(Order(user_id=u.id, product_id=p.id, price=p.price))
+    await session.commit()
+    await callback.message.answer(f"✅ Успешно!\n\n📦 Контент:\n`{p.content}`", parse_mode="Markdown")
+    await callback.answer()
+
+@dp.message(F.text == "👤 Профиль")
+async def profile(message: Message, session: AsyncSession):
+    res = await session.execute(select(User).where(User.id == message.from_user.id))
+    u = res.scalar_one_or_none()
+    await message.answer(f"👤 **Профиль**\n\n💰 Баланс: `${u.balance:.2f}`\n🆔 ID: `{u.id}`", parse_mode="Markdown")
+
+@dp.message(F.text == "💰 Пополнение")
+async def dep(message: Message):
+    await message.answer("💳 Для пополнения напишите @admin_support (Симуляция)")
+
+@dp.message(F.text == "📋 Инфо")
+async def info(message: Message):
+    await message.answer("ℹ️ Shadow Store v1.0\nВсе права защищены.")
+
+# --- ADMIN HANDLERS ---
+@dp.message(F.text == "➕ Категория", F.from_user.id == ADMIN_ID)
+async def adm_cat(message: Message, state: FSMContext):
+    await message.answer("Введите имя категории:")
+    await state.set_state(AdminStates.add_cat_name)
+
+@dp.message(AdminStates.add_cat_name)
+async def adm_cat_save(message: Message, state: FSMContext, session: AsyncSession):
+    session.add(Category(name=message.text))
+    await session.commit()
+    await message.answer("✅ Категория создана!")
+    await state.clear()
+
+@dp.message(F.text == "➕ Товар", F.from_user.id == ADMIN_ID)
+async def adm_prod(message: Message, state: FSMContext):
+    await message.answer("Введите название товара:")
+    await state.set_state(AdminStates.add_prod_name)
+
+@dp.message(AdminStates.add_prod_name)
+async def adm_p_name(message: Message, state: FSMContext):
+    await state.update_data(n=message.text)
+    await message.answer("Введите описание:")
+    await state.set_state(AdminStates.add_prod_desc)
+
+@dp.message(AdminStates.add_prod_desc)
+async def adm_p_desc(message: Message, state: FSMContext):
+    await state.update_data(d=message.text)
+    await message.answer("Введите цену (число):")
+    await state.set_state(AdminStates.add_prod_price)
+
+@dp.message(AdminStates.add_prod_price)
+async def adm_p_price(message: Message, state: FSMContext):
+    try:
+        await state.update_data(p=float(message.text))
+        await message.answer("Введите контент (ссылка/текст):")
+        await state.set_state(AdminStates.add_prod_content)
+    except: await message.answer("Ошибка! Введите число.")
+
+@dp.message(AdminStates.add_prod_content)
+async def adm_p_final(message: Message, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    res = await session.execute(select(Category))
+    cat = res.scalars().first()
+    if not cat: return await message.answer("Нет категорий!")
+    
+    session.add(Product(category_id=cat.id, name=data['n'], description=data['d'], price=data['p'], content=message.text))
+    await session.commit()
+    await message.answer("✅ Товар добавлен!")
+    await state.clear()
+
+@dp.message(F.text == "📊 Статистика", F.from_user.id == ADMIN_ID)
+async def adm_stat(message: Message, session: AsyncSession):
+    u_count = await session.execute(select(func.count(User.id)))
+    await message.answer(f"📈 Пользователей: {u_count.scalar()}")
+
+# --- STARTUP ---
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    
     async with async_session() as session:
-        # Seed Check
         res = await session.execute(select(Category))
         if not res.scalars().first():
-            # Initial Seed Data
-            cat1 = Category(name="Базы чатов")
-            cat2 = Category(name="Софт")
-            cat3 = Category(name="Мануалы")
-            cat4 = Category(name="Услуги")
-            session.add_all([cat1, cat2, cat3, cat4])
-            await session.flush()
-            
-            p1 = Product(category_id=cat1.id, name="TG VIP Base", description="10k channels", price=50.0, content="https://t.me/example_link")
-            p2 = Product(category_id=cat2.id, name="Parser Pro", description="Best parser", price=120.0, content="https://t.me/file_link")
-            p3 = Product(category_id=cat3.id, name="Carding Guide", description="Step by step", price=30.0, content="https://t.me/manual_link")
-            session.add_all([p1, p2, p3])
+            c = Category(name="Общее")
+            session.add(c)
             await session.commit()
+            await session.execute(select(c)) # refresh
+            session.add(Product(category_id=c.id, name="Тест", description="Тест", price=10.0, content="TEST_DATA"))
+            await session.commit()
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    bot = Bot(token=BOT_TOKEN)
+    dp.message.middleware(DbSessionMiddleware())
+    dp.callback_query.middleware(DbSessionMiddleware())
+    await init_db()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
